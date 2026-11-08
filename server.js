@@ -141,84 +141,41 @@ app.post('/api/seed-config', async (req, res) => {
 });
 
 // ==========================================
-// 4. ADMIN MANAGEMENT APIs (NEW)
+// 4. ADMIN DASHBOARD BULK APIs (NEW)
 // ==========================================
 
-// Change a user password
-app.post('/api/admin/update-password', async (req, res) => {
+// Bulk Save the Teacher/Admin Matrix
+app.post('/api/admin/bulk-users', async (req, res) => {
   try {
-    const { username, newPassword } = req.body;
-    await User.findOneAndUpdate({ username: username }, { password: newPassword });
+    const { users } = req.body;
+    
+    // Wipe old users and insert the exact array sent from the frontend matrix
+    await User.deleteMany({});
+    if (users && users.length > 0) {
+      await User.insertMany(users);
+    }
+    
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: "Failed to update password" });
+    res.status(500).json({ error: "Failed to bulk update users" });
   }
 });
 
-// Create a blank new cohort
-app.post('/api/admin/add-cohort', async (req, res) => {
+// Bulk Save a Cohort & Student Matrix
+app.post('/api/admin/save-cohort', async (req, res) => {
   try {
-    const { name } = req.body;
-    const cohortId = "cohort_" + Date.now();
-    const newCohort = new Cohort({
-      cohortId: cohortId,
-      name: name,
-      courses: []
-    });
-    await newCohort.save();
-    res.json({ success: true, cohortId: cohortId });
-  } catch (err) {
-    res.status(500).json({ error: "Failed to create cohort" });
-  }
-});
-
-// Edit student and safely migrate all their attendance data
-app.post('/api/admin/edit-student', async (req, res) => {
-  try {
-    const { cohortId, courseId, oldId, newId, newName } = req.body;
-
-    // 1. Update the student's name and ID in the Course Roster
-    const cohort = await Cohort.findOne({ cohortId: cohortId });
-    if (cohort) {
-      const course = cohort.courses.find(c => c.id === courseId);
-      if (course) {
-        const student = course.students.find(s => s.id === oldId);
-        if (student) {
-          student.id = newId;
-          student.name = newName;
-          cohort.markModified('courses');
-          await cohort.save();
-        }
-      }
-    }
-
-    // 2. Cascade: If the ID changed, migrate their records, notes, and incidents
-    if (oldId !== newId) {
-      const attRecord = await Course.findOne({ courseId: courseId });
-      if (attRecord && attRecord.data) {
-        const data = attRecord.data;
-        
-        if (data.records && data.records[oldId]) {
-          data.records[newId] = data.records[oldId];
-          delete data.records[oldId];
-        }
-        if (data.incidents && data.incidents[oldId]) {
-          data.incidents[newId] = data.incidents[oldId];
-          delete data.incidents[oldId];
-        }
-        if (data.notes && data.notes[oldId]) {
-          data.notes[newId] = data.notes[oldId];
-          delete data.notes[oldId];
-        }
-        
-        attRecord.markModified('data');
-        await attRecord.save();
-      }
-    }
-
+    const { cohort } = req.body;
+    
+    // This safely updates an existing cohort if the ID matches, or creates a brand new one if it doesn't
+    await Cohort.findOneAndUpdate(
+      { cohortId: cohort.id },
+      { name: cohort.name, courses: cohort.courses },
+      { upsert: true, new: true }
+    );
+    
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: "Failed to update student data" });
+    res.status(500).json({ error: "Failed to save cohort matrix" });
   }
 });
 

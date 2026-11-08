@@ -6,7 +6,7 @@ const app = express();
 
 // Allow requests from your GitHub Pages URL
 app.use(cors()); 
-app.use(express.json({ limit: '10mb' })); // Increased limit slightly to handle the initial data seed
+app.use(express.json({ limit: '10mb' })); 
 
 // Connect to MongoDB
 mongoose.connect(process.env.MONGODB_URI, { 
@@ -16,7 +16,7 @@ mongoose.connect(process.env.MONGODB_URI, {
   .catch(err => console.log(err));
 
 // ==========================================
-// 1. EXISTING ATTENDANCE SCHEMA (DO NOT TOUCH)
+// 1. EXISTING ATTENDANCE SCHEMA
 // ==========================================
 const CourseSchema = new mongoose.Schema({
   courseId: { type: String, unique: true },
@@ -24,7 +24,6 @@ const CourseSchema = new mongoose.Schema({
 });
 const Course = mongoose.model('Course', CourseSchema);
 
-// GET API: Send entire attendance database to frontend
 app.get('/api/db', async (req, res) => {
   try {
     const courses = await Course.find();
@@ -36,7 +35,6 @@ app.get('/api/db', async (req, res) => {
   }
 });
 
-// POST API: Save updates to a specific course's attendance
 app.post('/api/update', async (req, res) => {
   try {
     const { courseId, courseData } = req.body;
@@ -51,9 +49,8 @@ app.post('/api/update', async (req, res) => {
   }
 });
 
-
 // ==========================================
-// 2. NEW SCHEMAS FOR PHASE 4 (USERS, CATALOG, COHORTS)
+// 2. SYSTEM CONFIGURATION SCHEMAS
 // ==========================================
 const UserSchema = new mongoose.Schema({
   username: { type: String, unique: true },
@@ -79,12 +76,9 @@ const CohortSchema = new mongoose.Schema({
 });
 const Cohort = mongoose.model('Cohort', CohortSchema);
 
-
 // ==========================================
-// 3. NEW APIs FOR SYSTEM CONFIGURATION
+// 3. SYSTEM CONFIGURATION APIs
 // ==========================================
-
-// NEW GET API: Sends the Users, Catalog, and Cohorts to the frontend login screen
 app.get('/api/config', async (req, res) => {
   try {
     const users = await User.find({}, '-_id -__v');
@@ -106,30 +100,21 @@ app.get('/api/config', async (req, res) => {
       courses: c.courses
     }));
 
-    res.json({
-      users: users,
-      catalog: courseCatalog,
-      cohorts: formattedCohorts
-    });
+    res.json({ users: users, catalog: courseCatalog, cohorts: formattedCohorts });
   } catch (err) {
     res.status(500).json({ error: "Failed to fetch system config" });
   }
 });
 
-// NEW POST API: A temporary endpoint to upload (seed) your static .js files into MongoDB
 app.post('/api/seed-config', async (req, res) => {
   try {
     const { users, catalog, cohorts } = req.body;
-    
-    // Wipe only the structural tables to prevent duplicates (Attendance data remains safe)
     await User.deleteMany({});
     await Catalog.deleteMany({});
     await Cohort.deleteMany({});
 
-    // Insert Users
     if (users && users.length > 0) await User.insertMany(users);
     
-    // Insert Catalog
     if (catalog) {
       const catalogArr = Object.keys(catalog).map(key => ({
         courseId: key,
@@ -140,7 +125,6 @@ app.post('/api/seed-config', async (req, res) => {
       await Catalog.insertMany(catalogArr);
     }
 
-    // Insert Cohorts
     if (cohorts && cohorts.length > 0) {
       const cohortsArr = cohorts.map(c => ({
         cohortId: c.id,
@@ -150,10 +134,91 @@ app.post('/api/seed-config', async (req, res) => {
       await Cohort.insertMany(cohortsArr);
     }
 
-    res.json({ success: true, message: "Architecture Successfully Migrated to MongoDB!" });
+    res.json({ success: true, message: "Architecture Successfully Migrated!" });
   } catch (err) {
-    console.error(err);
     res.status(500).json({ error: "Failed to seed database" });
+  }
+});
+
+// ==========================================
+// 4. ADMIN MANAGEMENT APIs (NEW)
+// ==========================================
+
+// Change a user password
+app.post('/api/admin/update-password', async (req, res) => {
+  try {
+    const { username, newPassword } = req.body;
+    await User.findOneAndUpdate({ username: username }, { password: newPassword });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to update password" });
+  }
+});
+
+// Create a blank new cohort
+app.post('/api/admin/add-cohort', async (req, res) => {
+  try {
+    const { name } = req.body;
+    const cohortId = "cohort_" + Date.now();
+    const newCohort = new Cohort({
+      cohortId: cohortId,
+      name: name,
+      courses: []
+    });
+    await newCohort.save();
+    res.json({ success: true, cohortId: cohortId });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to create cohort" });
+  }
+});
+
+// Edit student and safely migrate all their attendance data
+app.post('/api/admin/edit-student', async (req, res) => {
+  try {
+    const { cohortId, courseId, oldId, newId, newName } = req.body;
+
+    // 1. Update the student's name and ID in the Course Roster
+    const cohort = await Cohort.findOne({ cohortId: cohortId });
+    if (cohort) {
+      const course = cohort.courses.find(c => c.id === courseId);
+      if (course) {
+        const student = course.students.find(s => s.id === oldId);
+        if (student) {
+          student.id = newId;
+          student.name = newName;
+          cohort.markModified('courses');
+          await cohort.save();
+        }
+      }
+    }
+
+    // 2. Cascade: If the ID changed, migrate their records, notes, and incidents
+    if (oldId !== newId) {
+      const attRecord = await Course.findOne({ courseId: courseId });
+      if (attRecord && attRecord.data) {
+        const data = attRecord.data;
+        
+        if (data.records && data.records[oldId]) {
+          data.records[newId] = data.records[oldId];
+          delete data.records[oldId];
+        }
+        if (data.incidents && data.incidents[oldId]) {
+          data.incidents[newId] = data.incidents[oldId];
+          delete data.incidents[oldId];
+        }
+        if (data.notes && data.notes[oldId]) {
+          data.notes[newId] = data.notes[oldId];
+          delete data.notes[oldId];
+        }
+        
+        attRecord.markModified('data');
+        await attRecord.save();
+      }
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to update student data" });
   }
 });
 

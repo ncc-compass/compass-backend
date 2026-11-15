@@ -11,3 +11,11 @@
     "mongoose": "^7.0.3"
   }
 }
+{
+  "name": "my-backend-service",
+  "version": "1.0.0",
+  "dependencies": {
+    "express": "^4.18.2",
+    "googleapis": "^140.0.0"
+  }
+}

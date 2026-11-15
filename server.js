@@ -1,26 +1,107 @@
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
+const { google } = require('googleapis');
 
 const app = express();
 
-// Allow requests from your GitHub Pages URL
 app.use(cors()); 
 app.use(express.json({ limit: '10mb' })); 
 
-// Connect to MongoDB
 mongoose.connect(process.env.MONGODB_URI, { 
     useNewUrlParser: true, 
     useUnifiedTopology: true 
 }).then(() => console.log("MongoDB Connected"))
   .catch(err => console.log(err));
 
-// ==========================================
-// 1. EXISTING ATTENDANCE SCHEMA
-// ==========================================
+// --- GOOGLE SHEETS SETUP ---
+function getGoogleAuth() {
+  const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS);
+  return new google.auth.GoogleAuth({
+    credentials,
+    scopes: ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive'],
+  });
+}
+
+async function backgroundSyncToGoogleSheet(courseId, courseData) {
+  try {
+    if (!process.env.GOOGLE_CREDENTIALS) return;
+    const auth = getGoogleAuth();
+    const sheets = google.sheets({ version: 'v4', auth: google.auth.fromJSON(JSON.parse(process.env.GOOGLE_CREDENTIALS)) });
+    const drive = google.drive({ version: 'v3', auth });
+
+    // Find or create a spreadsheet for this specific course
+    const sheetTitle = `Compass_Attendance_${courseId}`;
+    let spreadsheetId = courseData.googleSheetId;
+
+    if (!spreadsheetId) {
+      // Search drive for existing file
+      const res = await drive.files.list({
+        q: `name='${sheetTitle}' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false`,
+        fields: 'files(id, name)',
+      });
+
+      if (res.data.files.length > 0) {
+        spreadsheetId = res.data.files[0].id;
+      } else {
+        // Create new spreadsheet
+        const createResponse = await sheets.spreadsheets.create({
+          resource: { properties: { title: sheetTitle } },
+        });
+        spreadsheetId = createResponse.data.spreadsheetId;
+      }
+      
+      // Save sheet ID back to DB course record so we don't search every time
+      await Course.findOneAndUpdate({ courseId: courseId }, { $set: { googleSheetId: spreadsheetId } });
+    }
+
+    // Format attendance data into a grid (Rows = Students, Cols = Sessions)
+    const sessions = courseData.sessions || [];
+    const records = courseData.records || {};
+    const studentIds = Object.keys(records);
+
+    let headerRow = ['Candidate ID', 'Student Name', ...sessions, 'Attendance %'];
+    let rows = [headerRow];
+
+    // Note: Student names can be fetched or passed; here we output ID and status matrix
+    studentIds.forEach(stId => {
+      const sRec = records[stId] || {};
+      let attended = 0; let marked = 0;
+      let rowData = [stId];
+      
+      sessions.forEach(date => {
+        const status = sRec[date] || '';
+        rowData.push(status);
+        if (status !== '') {
+          marked++;
+          if (['Present', 'Late', 'Joined online'].includes(status)) attended++;
+        }
+      });
+
+      const rate = marked > 0 ? Math.round((attended / marked) * 100) + '%' : 'N/A';
+      rowData.push(rate);
+      rows.push(rowData);
+    });
+
+    // Write to Google Sheet
+    await sheets.spreadsheets.values.update({
+      spreadsheetId,
+      range: 'Sheet1!A1',
+      valueInputOption: 'USER_ENTERED',
+      resource: { values: rows },
+    });
+
+    console.log(`Synced course ${courseId} to Google Sheet ID: ${spreadsheetId}`);
+  } catch (err) {
+    console.error("Google Sheets Background Sync Error:", err);
+  }
+}
+
+// --- SCHEMAS & APIs ---
 const CourseSchema = new mongoose.Schema({
   courseId: { type: String, unique: true },
-  data: { type: mongoose.Schema.Types.Mixed, default: {} }
+  data: { type: mongoose.Schema.Types.Mixed, default: {} },
+  googleSheetId: { type: String, default: '' }
 });
 const Course = mongoose.model('Course', CourseSchema);
 
@@ -44,14 +125,14 @@ app.post('/api/update', async (req, res) => {
       { upsert: true, new: true }
     );
     res.json({ success: true });
+
+    // Trigger background sync without blocking response
+    backgroundSyncToGoogleSheet(courseId, courseData);
   } catch (err) {
     res.status(500).json({ error: "Failed to update course" });
   }
 });
 
-// ==========================================
-// 2. SYSTEM CONFIGURATION SCHEMAS
-// ==========================================
 const UserSchema = new mongoose.Schema({
   username: { type: String, unique: true },
   password: { type: String }, 
@@ -76,30 +157,16 @@ const CohortSchema = new mongoose.Schema({
 });
 const Cohort = mongoose.model('Cohort', CohortSchema);
 
-// ==========================================
-// 3. SYSTEM CONFIGURATION APIs
-// ==========================================
 app.get('/api/config', async (req, res) => {
   try {
     const users = await User.find({}, '-_id -__v');
-    
     const catalogItems = await Catalog.find({}, '-_id -__v');
     let courseCatalog = {};
     catalogItems.forEach(item => {
-      courseCatalog[item.courseId] = {
-        name: item.name,
-        instructor: item.instructor,
-        stream: item.stream
-      };
+      courseCatalog[item.courseId] = { name: item.name, instructor: item.instructor, stream: item.stream };
     });
-
     const cohorts = await Cohort.find({}, '-_id -__v');
-    const formattedCohorts = cohorts.map(c => ({
-      id: c.cohortId,
-      name: c.name,
-      courses: c.courses
-    }));
-
+    const formattedCohorts = cohorts.map(c => ({ id: c.cohortId, name: c.name, courses: c.courses }));
     res.json({ users: users, catalog: courseCatalog, cohorts: formattedCohorts });
   } catch (err) {
     res.status(500).json({ error: "Failed to fetch system config" });
@@ -112,67 +179,42 @@ app.post('/api/seed-config', async (req, res) => {
     await User.deleteMany({});
     await Catalog.deleteMany({});
     await Cohort.deleteMany({});
-
     if (users && users.length > 0) await User.insertMany(users);
-    
     if (catalog) {
       const catalogArr = Object.keys(catalog).map(key => ({
-        courseId: key,
-        name: catalog[key].name,
-        instructor: catalog[key].instructor,
-        stream: catalog[key].stream
+        courseId: key, name: catalog[key].name, instructor: catalog[key].instructor, stream: catalog[key].stream
       }));
       await Catalog.insertMany(catalogArr);
     }
-
     if (cohorts && cohorts.length > 0) {
-      const cohortsArr = cohorts.map(c => ({
-        cohortId: c.id,
-        name: c.name,
-        courses: c.courses
-      }));
+      const cohortsArr = cohorts.map(c => ({ cohortId: c.id, name: c.name, courses: c.courses }));
       await Cohort.insertMany(cohortsArr);
     }
-
     res.json({ success: true, message: "Architecture Successfully Migrated!" });
   } catch (err) {
     res.status(500).json({ error: "Failed to seed database" });
   }
 });
 
-// ==========================================
-// 4. ADMIN DASHBOARD BULK APIs (NEW)
-// ==========================================
-
-// Bulk Save the Teacher/Admin Matrix
 app.post('/api/admin/bulk-users', async (req, res) => {
   try {
     const { users } = req.body;
-    
-    // Wipe old users and insert the exact array sent from the frontend matrix
     await User.deleteMany({});
-    if (users && users.length > 0) {
-      await User.insertMany(users);
-    }
-    
+    if (users && users.length > 0) await User.insertMany(users);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: "Failed to bulk update users" });
   }
 });
 
-// Bulk Save a Cohort & Student Matrix
 app.post('/api/admin/save-cohort', async (req, res) => {
   try {
     const { cohort } = req.body;
-    
-    // This safely updates an existing cohort if the ID matches, or creates a brand new one if it doesn't
     await Cohort.findOneAndUpdate(
       { cohortId: cohort.id },
       { name: cohort.name, courses: cohort.courses },
       { upsert: true, new: true }
     );
-    
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: "Failed to save cohort matrix" });

@@ -25,11 +25,10 @@ function getGoogleAuth() {
 
 async function backgroundSyncToGoogleSheet(courseId, courseData) {
   try {
-    if (!process.env.GOOGLE_CREDENTIALS || !process.env.GOOGLE_DRIVE_FOLDER_ID) return;
+    if (!process.env.GOOGLE_CREDENTIALS) return;
     const auth = getGoogleAuth();
     const sheets = google.sheets({ version: 'v4', auth });
     const drive = google.drive({ version: 'v3', auth });
-    const folderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
 
     // 1. Find which Cohort this course belongs to
     const cohorts = await Cohort.find();
@@ -49,32 +48,24 @@ async function backgroundSyncToGoogleSheet(courseId, courseData) {
     
     if (!targetCohort) return; 
 
-    // 2. Find or Create the Master Spreadsheet directly inside YOUR Google Drive folder
-    const sheetTitle = `Compass_Attendance_${targetCohort.name.replace(/[^a-zA-Z0-9 -]/g, '')}`;
+    // 2. Search for the Spreadsheet YOU created and shared with the bot
+    const sheetTitle = `Compass_Attendance_${targetCohort.name}`;
     let spreadsheetId = targetCohort.googleSheetId;
 
     if (!spreadsheetId) {
       const res = await drive.files.list({
-        q: `'${folderId}' in parents and name='${sheetTitle}' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false`,
+        q: `name='${sheetTitle}' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false`,
         fields: 'files(id, name)',
       });
 
       if (res.data.files.length > 0) {
         spreadsheetId = res.data.files[0].id;
+        // Save sheet ID back to Cohort so the bot never has to search for it again
+        await Cohort.findOneAndUpdate({ cohortId: targetCohort.cohortId }, { $set: { googleSheetId: spreadsheetId } });
       } else {
-        // Create the file directly in the shared folder
-        const createResponse = await drive.files.create({
-          requestBody: {
-            name: sheetTitle,
-            mimeType: 'application/vnd.google-apps.spreadsheet',
-            parents: [folderId]
-          },
-          fields: 'id'
-        });
-        spreadsheetId = createResponse.data.id;
+        console.error(`\n=== ACTION REQUIRED ===\nThe spreadsheet "${sheetTitle}" was not found! Make sure you created it and shared it with the service account.\n`);
+        return; // Exit safely without crashing
       }
-      
-      await Cohort.findOneAndUpdate({ cohortId: targetCohort.cohortId }, { $set: { googleSheetId: spreadsheetId } });
     }
 
     // 3. Check if a Tab exists for this specific Course, if not create it
@@ -172,6 +163,8 @@ app.post('/api/update', async (req, res) => {
       { upsert: true, new: true }
     );
     res.json({ success: true });
+    
+    // Trigger background sync without blocking response
     backgroundSyncToGoogleSheet(courseId, courseData);
   } catch (err) {
     res.status(500).json({ error: "Failed to update course" });

@@ -27,15 +27,32 @@ async function backgroundSyncToGoogleSheet(courseId, courseData) {
   try {
     if (!process.env.GOOGLE_CREDENTIALS) return;
     const auth = getGoogleAuth();
-    const sheets = google.sheets({ version: 'v4', auth: google.auth.fromJSON(JSON.parse(process.env.GOOGLE_CREDENTIALS)) });
+    const sheets = google.sheets({ version: 'v4', auth });
     const drive = google.drive({ version: 'v3', auth });
 
-    // Find or create a spreadsheet for this specific course
-    const sheetTitle = `Compass_Attendance_${courseId}`;
-    let spreadsheetId = courseData.googleSheetId;
+    // 1. Find which Cohort this course belongs to
+    const cohorts = await Cohort.find();
+    let targetCohort = null;
+    let targetCourseName = courseId;
+    let studentRoster = [];
+    
+    for (let c of cohorts) {
+      const match = c.courses.find(crs => crs.id === courseId);
+      if (match) {
+        targetCohort = c;
+        targetCourseName = match.name;
+        studentRoster = match.students || [];
+        break;
+      }
+    }
+    
+    if (!targetCohort) return; // Course not attached to a cohort
+
+    // 2. Find or Create the Master Spreadsheet for the Cohort
+    const sheetTitle = `Compass_Attendance_${targetCohort.name.replace(/[^a-zA-Z0-9 -]/g, '')}`;
+    let spreadsheetId = targetCohort.googleSheetId;
 
     if (!spreadsheetId) {
-      // Search drive for existing file
       const res = await drive.files.list({
         q: `name='${sheetTitle}' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false`,
         fields: 'files(id, name)',
@@ -44,18 +61,44 @@ async function backgroundSyncToGoogleSheet(courseId, courseData) {
       if (res.data.files.length > 0) {
         spreadsheetId = res.data.files[0].id;
       } else {
-        // Create new spreadsheet
         const createResponse = await sheets.spreadsheets.create({
           resource: { properties: { title: sheetTitle } },
         });
         spreadsheetId = createResponse.data.spreadsheetId;
+
+        // Share with your personal Gmail
+        await drive.permissions.create({
+          fileId: spreadsheetId,
+          sendNotificationEmail: true,
+          requestBody: {
+            role: 'writer',
+            type: 'user',
+            emailAddress: 'rahmansezad@gmail.com' 
+          }
+        });
       }
       
-      // Save sheet ID back to DB course record so we don't search every time
-      await Course.findOneAndUpdate({ courseId: courseId }, { $set: { googleSheetId: spreadsheetId } });
+      // Save sheet ID back to Cohort so we don't recreate it
+      await Cohort.findOneAndUpdate({ cohortId: targetCohort.cohortId }, { $set: { googleSheetId: spreadsheetId } });
     }
 
-    // Format attendance data into a grid (Rows = Students, Cols = Sessions)
+    // 3. Check if a Tab exists for this specific Course, if not create it
+    const tabTitle = targetCourseName.substring(0, 31).replace(/[\]\[*?:\/']/g, ''); // Clean for sheets
+    const sheetDetails = await sheets.spreadsheets.get({ spreadsheetId });
+    const existingTabs = sheetDetails.data.sheets.map(s => s.properties.title);
+
+    if (!existingTabs.includes(tabTitle)) {
+      await sheets.spreadsheets.batchUpdate({
+        spreadsheetId,
+        resource: {
+          requests: [{
+            addSheet: { properties: { title: tabTitle } }
+          }]
+        }
+      });
+    }
+
+    // 4. Format Data (Rows = Students, Cols = Sessions)
     const sessions = courseData.sessions || [];
     const records = courseData.records || {};
     const studentIds = Object.keys(records);
@@ -63,11 +106,15 @@ async function backgroundSyncToGoogleSheet(courseId, courseData) {
     let headerRow = ['Candidate ID', 'Student Name', ...sessions, 'Attendance %'];
     let rows = [headerRow];
 
-    // Note: Student names can be fetched or passed; here we output ID and status matrix
     studentIds.forEach(stId => {
       const sRec = records[stId] || {};
       let attended = 0; let marked = 0;
-      let rowData = [stId];
+      
+      // Look up student name from the roster
+      const stObj = studentRoster.find(s => String(s.id).trim() === String(stId).trim());
+      const stName = stObj ? stObj.name : 'Unknown';
+
+      let rowData = [stId, stName];
       
       sessions.forEach(date => {
         const status = sRec[date] || '';
@@ -83,15 +130,14 @@ async function backgroundSyncToGoogleSheet(courseId, courseData) {
       rows.push(rowData);
     });
 
-    // Write to Google Sheet
+    // 5. Update the specific Course Tab in the Cohort Spreadsheet
     await sheets.spreadsheets.values.update({
       spreadsheetId,
-      range: 'Sheet1!A1',
+      range: `'${tabTitle}'!A1`,
       valueInputOption: 'USER_ENTERED',
       resource: { values: rows },
     });
 
-    console.log(`Synced course ${courseId} to Google Sheet ID: ${spreadsheetId}`);
   } catch (err) {
     console.error("Google Sheets Background Sync Error:", err);
   }
@@ -100,10 +146,17 @@ async function backgroundSyncToGoogleSheet(courseId, courseData) {
 // --- SCHEMAS & APIs ---
 const CourseSchema = new mongoose.Schema({
   courseId: { type: String, unique: true },
-  data: { type: mongoose.Schema.Types.Mixed, default: {} },
-  googleSheetId: { type: String, default: '' }
+  data: { type: mongoose.Schema.Types.Mixed, default: {} }
 });
 const Course = mongoose.model('Course', CourseSchema);
+
+const CohortSchema = new mongoose.Schema({
+  cohortId: { type: String, unique: true },
+  name: { type: String },
+  courses: { type: mongoose.Schema.Types.Mixed, default: [] },
+  googleSheetId: { type: String, default: '' } // Added to store the master sheet ID
+});
+const Cohort = mongoose.model('Cohort', CohortSchema);
 
 app.get('/api/db', async (req, res) => {
   try {
@@ -150,13 +203,6 @@ const CatalogSchema = new mongoose.Schema({
 });
 const Catalog = mongoose.model('Catalog', CatalogSchema);
 
-const CohortSchema = new mongoose.Schema({
-  cohortId: { type: String, unique: true },
-  name: { type: String },
-  courses: { type: mongoose.Schema.Types.Mixed, default: [] } 
-});
-const Cohort = mongoose.model('Cohort', CohortSchema);
-
 app.get('/api/config', async (req, res) => {
   try {
     const users = await User.find({}, '-_id -__v');
@@ -187,7 +233,7 @@ app.post('/api/seed-config', async (req, res) => {
       await Catalog.insertMany(catalogArr);
     }
     if (cohorts && cohorts.length > 0) {
-      const cohortsArr = cohorts.map(c => ({ cohortId: c.id, name: c.name, courses: c.courses }));
+      const cohortsArr = cohorts.map(c => ({ cohortId: c.id, name: c.name, courses: c.courses, googleSheetId: '' }));
       await Cohort.insertMany(cohortsArr);
     }
     res.json({ success: true, message: "Architecture Successfully Migrated!" });

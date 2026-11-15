@@ -25,10 +25,11 @@ function getGoogleAuth() {
 
 async function backgroundSyncToGoogleSheet(courseId, courseData) {
   try {
-    if (!process.env.GOOGLE_CREDENTIALS) return;
+    if (!process.env.GOOGLE_CREDENTIALS || !process.env.GOOGLE_DRIVE_FOLDER_ID) return;
     const auth = getGoogleAuth();
     const sheets = google.sheets({ version: 'v4', auth });
     const drive = google.drive({ version: 'v3', auth });
+    const folderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
 
     // 1. Find which Cohort this course belongs to
     const cohorts = await Cohort.find();
@@ -46,44 +47,38 @@ async function backgroundSyncToGoogleSheet(courseId, courseData) {
       }
     }
     
-    if (!targetCohort) return; // Course not attached to a cohort
+    if (!targetCohort) return; 
 
-    // 2. Find or Create the Master Spreadsheet for the Cohort
+    // 2. Find or Create the Master Spreadsheet directly inside YOUR Google Drive folder
     const sheetTitle = `Compass_Attendance_${targetCohort.name.replace(/[^a-zA-Z0-9 -]/g, '')}`;
     let spreadsheetId = targetCohort.googleSheetId;
 
     if (!spreadsheetId) {
       const res = await drive.files.list({
-        q: `name='${sheetTitle}' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false`,
+        q: `'${folderId}' in parents and name='${sheetTitle}' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false`,
         fields: 'files(id, name)',
       });
 
       if (res.data.files.length > 0) {
         spreadsheetId = res.data.files[0].id;
       } else {
-        const createResponse = await sheets.spreadsheets.create({
-          resource: { properties: { title: sheetTitle } },
-        });
-        spreadsheetId = createResponse.data.spreadsheetId;
-
-        // Share with your personal Gmail
-        await drive.permissions.create({
-          fileId: spreadsheetId,
-          sendNotificationEmail: true,
+        // Create the file directly in the shared folder
+        const createResponse = await drive.files.create({
           requestBody: {
-            role: 'writer',
-            type: 'user',
-            emailAddress: 'rahmansezad@gmail.com' 
-          }
+            name: sheetTitle,
+            mimeType: 'application/vnd.google-apps.spreadsheet',
+            parents: [folderId]
+          },
+          fields: 'id'
         });
+        spreadsheetId = createResponse.data.id;
       }
       
-      // Save sheet ID back to Cohort so we don't recreate it
       await Cohort.findOneAndUpdate({ cohortId: targetCohort.cohortId }, { $set: { googleSheetId: spreadsheetId } });
     }
 
     // 3. Check if a Tab exists for this specific Course, if not create it
-    const tabTitle = targetCourseName.substring(0, 31).replace(/[\]\[*?:\/']/g, ''); // Clean for sheets
+    const tabTitle = targetCourseName.substring(0, 31).replace(/[\]\[*?:\/']/g, ''); 
     const sheetDetails = await sheets.spreadsheets.get({ spreadsheetId });
     const existingTabs = sheetDetails.data.sheets.map(s => s.properties.title);
 
@@ -110,7 +105,6 @@ async function backgroundSyncToGoogleSheet(courseId, courseData) {
       const sRec = records[stId] || {};
       let attended = 0; let marked = 0;
       
-      // Look up student name from the roster
       const stObj = studentRoster.find(s => String(s.id).trim() === String(stId).trim());
       const stName = stObj ? stObj.name : 'Unknown';
 
@@ -154,7 +148,7 @@ const CohortSchema = new mongoose.Schema({
   cohortId: { type: String, unique: true },
   name: { type: String },
   courses: { type: mongoose.Schema.Types.Mixed, default: [] },
-  googleSheetId: { type: String, default: '' } // Added to store the master sheet ID
+  googleSheetId: { type: String, default: '' } 
 });
 const Cohort = mongoose.model('Cohort', CohortSchema);
 
@@ -178,8 +172,6 @@ app.post('/api/update', async (req, res) => {
       { upsert: true, new: true }
     );
     res.json({ success: true });
-
-    // Trigger background sync without blocking response
     backgroundSyncToGoogleSheet(courseId, courseData);
   } catch (err) {
     res.status(500).json({ error: "Failed to update course" });

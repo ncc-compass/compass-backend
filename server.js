@@ -4,6 +4,11 @@ const cors = require('cors');
 
 const app = express();
 
+// --- ADD THESE TWO LINES FOR UPTIMEROBOT ---
+app.get('/', (req, res) => res.status(200).send('Compass Server is Awake!'));
+app.head('/', (req, res) => res.status(200).end());
+// -------------------------------------------
+
 // Allow requests from your GitHub Pages URL
 app.use(cors()); 
 app.use(express.json({ limit: '10mb' })); 
